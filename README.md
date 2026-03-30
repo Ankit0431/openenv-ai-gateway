@@ -1,3 +1,12 @@
+---
+title: AI Gateway Orchestrator
+emoji: 🚀
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 8000
+---
+
 # AI Gateway Orchestrator (OpenEnv RL Environment)
 
 Welcome to the AI Gateway Orchestrator. This project provides a stateful Reinforcement Learning environment built on OpenEnv. It simulates production-like gateway orchestration where the agent balances latency (SLA), compute cost, and model capability.
