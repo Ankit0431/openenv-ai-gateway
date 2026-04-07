@@ -29,7 +29,7 @@ TEMPERATURE = 0.0  # Keep at 0.0 for deterministic, reproducible results
 FALLBACK_ACTION = MyAction(action_type=ActionType.HOLD)
 
 # Normalization constants for [0, 1] scoring
-MAX_TOTAL_REWARD = 360.0  # Approx 1.0 optimal reward * 3600 steps
+MAX_TOTAL_REWARD = 3600.0  # Approx 1.0 optimal reward * 3600 steps
 SUCCESS_SCORE_THRESHOLD = 0.1
 
 SYSTEM_PROMPT = """
