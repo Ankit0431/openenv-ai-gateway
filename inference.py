@@ -17,12 +17,9 @@ from models import MyAction, ActionType
 
 load_dotenv(".env")
 
-API_BASE_URL = os.getenv("API_BASE_URL")
-if not API_BASE_URL:
-    print("[WARNING] API_BASE_URL is not set. Defaulting to Hugging Face Router API.")
-    API_BASE_URL = "https://router.huggingface.co/v1"
-API_KEY = os.getenv("HF_TOKEN") 
-MODEL_NAME = os.getenv("MODEL_NAME")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct") # Put your actual model here
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 
 # Evaluation Identifiers
 TASK_NAME = os.getenv("MY_ENV_TASK", "gateway_orchestration")
@@ -32,7 +29,7 @@ TEMPERATURE = 0.0  # Keep at 0.0 for deterministic, reproducible results
 FALLBACK_ACTION = MyAction(action_type=ActionType.HOLD)
 
 # Normalization constants for [0, 1] scoring
-MAX_TOTAL_REWARD = 3600.0  # Approx 1.0 optimal reward * 3600 steps
+MAX_TOTAL_REWARD = 360.0  # Approx 1.0 optimal reward * 3600 steps
 SUCCESS_SCORE_THRESHOLD = 0.1
 
 SYSTEM_PROMPT = """
@@ -173,9 +170,4 @@ def main() -> None:
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
     
 if __name__ == "__main__":
-    if not API_KEY:
-        print("[ERROR]: HF_TOKEN is missing. Cannot initialize client.")
-    elif not MODEL_NAME:
-        print("[ERROR]: MODEL_NAME is missing. Cannot initialize client.")
-    else:
-        main()
+    main()
