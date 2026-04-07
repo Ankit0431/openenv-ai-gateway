@@ -7,7 +7,7 @@ Target Environment: AI Gateway Orchestrator
 import os
 import time
 import json
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List
 
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -19,13 +19,21 @@ load_dotenv(".env")
 
 API_BASE_URL = os.getenv("API_BASE_URL")
 if not API_BASE_URL:
-    print("WARNING: API_BASE_URL is not set. Defaulting to Hugging Face Router API.")
+    print("[WARNING] API_BASE_URL is not set. Defaulting to Hugging Face Router API.")
     API_BASE_URL = "https://router.huggingface.co/v1"
 API_KEY = os.getenv("HF_TOKEN") 
 MODEL_NAME = os.getenv("MODEL_NAME")
 
+# Evaluation Identifiers
+TASK_NAME = os.getenv("MY_ENV_TASK", "gateway_orchestration")
+BENCHMARK = os.getenv("MY_ENV_BENCHMARK", "ai_gateway_env")
+
 TEMPERATURE = 0.0  # Keep at 0.0 for deterministic, reproducible results
 FALLBACK_ACTION = MyAction(action_type=ActionType.HOLD)
+
+# Normalization constants for [0, 1] scoring
+MAX_TOTAL_REWARD = 3600.0  # Approx 1.0 optimal reward * 3600 steps
+SUCCESS_SCORE_THRESHOLD = 0.1
 
 SYSTEM_PROMPT = """
 You are an AI Gateway Orchestrator RL Agent. 
@@ -48,6 +56,21 @@ You MUST reply with EXACTLY valid JSON matching this schema. Do not include mark
 }
 """
 
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
+
 def parse_llm_response(response_text: str) -> MyAction:
     """Safely parse the LLM's JSON text into our strict Pydantic Action model."""
     try:
@@ -62,73 +85,97 @@ def main() -> None:
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
     env = MyEnvironment()
-    print("Initializing Gateway Environment...")
     
-    # 42 ensures the traffic/market data is identical for the grader
-    obs = env.reset(seed=42) 
-    total_reward = 0.0
-
+    rewards: List[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
+    
+    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+    
     try:
-        for step in range(env.max_steps):
+            obs = env.reset(seed=42)
             
-            # To save API costs and massive inference time on 3600 steps, 
-            # we only query the LLM if there is an actionable state.
-            if obs.queue_depth > 0 or obs.queue_velocity > 3 or (obs.queue_depth == 0 and obs.active_vms > 0):
+            for step in range(1, env.max_steps + 1):
+                action_str = ""
+                error = None
                 
-                # Format observation for the LLM
-                obs_dict = {
-                    "queue_depth": obs.queue_depth,
-                    "active_vms": obs.active_vms,
-                    "booting_vms": len(env.provisioning_vms),
-                    "current_spot_price": round(obs.current_spot_price, 4),
-                    "price_moving_avg_5m": round(obs.price_moving_avg_5m, 4),
-                    "queue_velocity": obs.queue_velocity,
-                    "current_request_id": obs.current_request_id,
-                    "current_request_type": obs.current_request_type,
-                    "current_request_sla": obs.current_request_sla,
-                    "current_step": env.state.step_count
-                }
+                # To save API costs on 3600 steps, query LLM only on actionable states
+                if obs.queue_depth > 0 or obs.queue_velocity > 3 or (obs.queue_depth == 0 and obs.active_vms > 0):
+                    obs_dict = {
+                        "queue_depth": obs.queue_depth,
+                        "active_vms": obs.active_vms,
+                        "booting_vms": len(env.provisioning_vms),
+                        "current_spot_price": round(obs.current_spot_price, 4),
+                        "price_moving_avg_5m": round(obs.price_moving_avg_5m, 4),
+                        "queue_velocity": obs.queue_velocity,
+                        "current_request_id": obs.current_request_id,
+                        "current_request_type": obs.current_request_type,
+                        "current_request_sla": obs.current_request_sla,
+                        "current_step": getattr(env.state, 'step_count', step)
+                    }
 
-                try:
-                    completion = client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=[
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            {"role": "user", "content": f"Current State: {json.dumps(obs_dict)}"}
-                        ],
-                        response_format={ "type": "json_object" },
-                        temperature=TEMPERATURE,
-                        seed=42 # Enforces reproducibility
-                    )
-                    response_text = completion.choices[0].message.content or "{}"
-                    action = parse_llm_response(response_text)
-                    print(f"-> Agent chose: {action.action_type.value}")
-                    
-                except Exception as exc:
-                    print(f"API Error at step {step}: {exc}. Using fallback.")
+                    try:
+                        completion = client.chat.completions.create(
+                            model=MODEL_NAME,
+                            messages=[
+                                {"role": "system", "content": SYSTEM_PROMPT},
+                                {"role": "user", "content": f"Current State: {json.dumps(obs_dict)}"}
+                            ],
+                            response_format={ "type": "json_object" },
+                            temperature=TEMPERATURE,
+                            seed=42
+                        )
+                        response_text = completion.choices[0].message.content or "{}"
+                        action = parse_llm_response(response_text)
+                    except Exception as exc:
+                        action = FALLBACK_ACTION
+                        error = str(exc).replace("\n", " ")  # Scrub newlines to protect regex parser
+                else:
                     action = FALLBACK_ACTION
-            else:
-                # If queue is completely dead and no VMs need managing, just wait.
-                action = FALLBACK_ACTION
 
-            # Execute the action in the environment
-            obs = env.step(action)
-            total_reward += obs.reward
-            
-            # Progress Logging
-            if step % 500 == 0:
-                print(f"Step {step}/{env.max_steps} | Action: {action.action_type.value} | Cumulative Reward: {total_reward:.2f}")
+                # Format action cleanly for the log (e.g., "route_request(LLM)")
+                action_str = f"{action.action_type.value}"
+                if getattr(action, "target", None):
+                    action_str += f"({action.target})"
+                elif getattr(action, "lora_id", None):
+                    action_str += f"({action.lora_id})"
 
-        print("\nEpisode Complete.")
-        print(f"Final Inference Reward: {total_reward:.2f}")
+                # Execute the action
+                try:
+                    obs = env.step(action)
+                    reward = obs.reward
+                    done = obs.done
+                except Exception as exc:
+                    reward = 0.0
+                    done = True
+                    error = str(exc).replace("\n", " ")
+
+                rewards.append(reward)
+                steps_taken = step
+
+                log_step(step=step, action=action_str, reward=reward, done=done, error=error)
+
+                if done:
+                    break
+
+            # Calculate normalized score
+            total_reward = sum(rewards)
+            score = total_reward / MAX_TOTAL_REWARD if MAX_TOTAL_REWARD > 0 else 0.0
+            score = min(max(score, 0.0), 1.0)  # Clamp exactly between [0, 1]
+            success = score >= SUCCESS_SCORE_THRESHOLD
 
     except KeyboardInterrupt:
-        print("\nInference interrupted by user.")
+        print("\n[DEBUG] Inference interrupted by user.", flush=True)
+    except Exception as e:
+        print(f"\n[ERROR] Fatal inference error: {e}", flush=True)
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
     
 if __name__ == "__main__":
     if not API_KEY:
-        print("ERROR: HF_TOKEN is missing. Cannot initialize client.")
+        print("[ERROR]: HF_TOKEN is missing. Cannot initialize client.")
     elif not MODEL_NAME:
-        print("ERROR: MODEL_NAME is missing. Cannot initialize client.")
+        print("[ERROR]: MODEL_NAME is missing. Cannot initialize client.")
     else:
         main()
