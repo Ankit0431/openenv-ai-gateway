@@ -29,7 +29,8 @@ TEMPERATURE = 0.0  # Keep at 0.0 for deterministic, reproducible results
 FALLBACK_ACTION = MyAction(action_type=ActionType.HOLD)
 
 # Normalization constants for [0, 1] scoring
-MAX_TOTAL_REWARD = 3600.0  # Approx 1.0 optimal reward * 3600 steps
+MAX_STEPS = 360
+MAX_TOTAL_REWARD = 360.0  # Approx 1.0 optimal reward * 360 steps
 SUCCESS_SCORE_THRESHOLD = 0.1
 
 SYSTEM_PROMPT = """
@@ -40,7 +41,7 @@ Rules:
 1. If a request is 'complex', route to 'LLM'. If 'simple', route to 'SLM'.
 2. If spot price > moving average, hold batch jobs. Real-time jobs must be routed immediately.
 3. If queue_velocity > 3 and active_vms = 0 and booting_vms = 0, provision a VM (g4dn.xlarge, lora: medical-v1).
-4. If queue_depth = 0 and active VMs > 0, terminate a VM.
+4. 4. NEVER terminate your last active VM. Only terminate a VM if queue_depth = 0 AND active_vms > 1.
 
 You MUST reply with EXACTLY valid JSON matching this schema. Do not include markdown formatting or explanations.
 {
@@ -79,7 +80,7 @@ def parse_llm_response(response_text: str) -> MyAction:
         return FALLBACK_ACTION
 
 def main() -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY, timeout=10.0)
 
     env = MyEnvironment()
     
@@ -93,12 +94,18 @@ def main() -> None:
     try:
             obs = env.reset(seed=42)
             
-            for step in range(1, env.max_steps + 1):
+            for step in range(1, MAX_STEPS + 1):
                 action_str = ""
                 error = None
                 
+                # If we have 0 active VMs but one is provisioning, we are in a cold start.
+                # Do NOT waste time/API calls asking the LLM. Just HOLD.
+                is_waiting_for_boot = obs.active_vms == 0 and len(env.provisioning_vms) > 0
+                if is_waiting_for_boot:
+                    action = FALLBACK_ACTION
+
                 # To save API costs on 3600 steps, query LLM only on actionable states
-                if obs.queue_depth > 0 or obs.queue_velocity > 3 or (obs.queue_depth == 0 and obs.active_vms > 0):
+                elif obs.queue_depth > 0 or obs.queue_velocity > 3 or (obs.queue_depth == 0 and obs.active_vms > 0):
                     obs_dict = {
                         "queue_depth": obs.queue_depth,
                         "active_vms": obs.active_vms,
@@ -125,9 +132,26 @@ def main() -> None:
                         )
                         response_text = completion.choices[0].message.content or "{}"
                         action = parse_llm_response(response_text)
+                        
+                        # ==============================================================
+                        # PROGRAMMATIC GUARDRAILS
+                        # ==============================================================
+                        
+                        # Guardrail 1: Prevent infrastructure suicide
+                        if action.action_type == ActionType.TERMINATE and obs.active_vms <= 1:
+                            action = FALLBACK_ACTION # Force it to HOLD instead
+                            
+                        # Guardrail 2: Prevent routing to dead air (no servers online)
+                        elif action.action_type == ActionType.ROUTE and obs.active_vms == 0:
+                            # If no servers are booting, force it to PROVISION!
+                            if len(env.provisioning_vms) == 0:
+                                action = MyAction(action_type=ActionType.PROVISION, lora_id="medical-v1")
+                            else:
+                                action = FALLBACK_ACTION # Just wait for the boot
+                                
                     except Exception as exc:
                         action = FALLBACK_ACTION
-                        error = str(exc).replace("\n", " ")  # Scrub newlines to protect regex parser
+                        error = str(exc).replace("\n", " ")  # Scrub newlines
                 else:
                     action = FALLBACK_ACTION
 

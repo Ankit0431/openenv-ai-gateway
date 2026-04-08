@@ -1,3 +1,4 @@
+import math
 import random
 from collections import deque
 from typing import List, Dict, Any
@@ -22,8 +23,8 @@ class MyEnvironment(Environment):
     def __init__(self):
         super().__init__()
         self._state = State(episode_id=str(uuid4()), step_count=0)
-        self.max_steps = 3600
-        self.vm_cold_start_steps = 120
+        self.max_steps = 720 # 1 step = 5 seconds, so 720 steps = 1 hour of simulation
+        self.vm_cold_start_steps = 24 # 24 steps = 2 minute cold start at 5s per step
         self.hourly_budget = 50.0  # Example budget
         self.queue = deque()
         self.active_vms = 0
@@ -40,10 +41,11 @@ class MyEnvironment(Environment):
             # 1. Pre-generate Market Volatility (Spot Prices)
             # Simulating a volatile market using a simple random walk
             self.spot_prices = []
-            current_price = 0.05
-            for _ in range(self.max_steps):
-                current_price += random.uniform(-0.005, 0.005)
-                self.spot_prices.append(max(0.01, current_price)) # Price cannot be negative
+            for step in range(self.max_steps):
+                # Creates a wave that smoothly oscillates between $0.02 and $0.08
+                base_price = 0.05 + 0.03 * math.sin(step / 50.0)
+                noise = random.uniform(-0.005, 0.005)
+                self.spot_prices.append(max(0.01, base_price + noise))
                 
             # 2. Pre-generate Traffic Bursts
             # We will store a list of incoming requests for every single second (timestep)
@@ -63,7 +65,7 @@ class MyEnvironment(Environment):
                     self.traffic_schedule[step].append({
                         "id": str(uuid4())[:8],
                         "type": "complex" if random.random() < 0.3 else "simple",
-                        "sla_deadline": step + (5 if random.random() < 0.8 else 86400), # Real-time SLA = 5 steps
+                        "sla_deadline": step + (2 if random.random() < 0.8 else 86400), # Real-time SLA = 2 steps
                         "wait_time": 0
                     })
 
@@ -71,8 +73,8 @@ class MyEnvironment(Environment):
             self.queue = deque()
             self.queue_history = deque(maxlen=10) # For calculating queue_velocity
             self.active_vms = [] 
-            self.provisioning_vms = [] # Tracks VMs in the 120-step cold start phase
-            self.price_history_5m = deque(maxlen=300) # 5 minutes = 300 steps
+            self.provisioning_vms = [] # Tracks VMs in the 24-step cold start phase
+            self.price_history_5m = deque(maxlen=60) # 5 minutes = 60 steps at 5s per step
             self.step_count = 0
             ACTIVE_SESSIONS[actual_episode_id] = {
                 "queue": self.queue,
@@ -119,13 +121,16 @@ class MyEnvironment(Environment):
             # Task 1 & 3 Logic: Check if routed correctly and apply dense rewards
             # (Simplified logic: assuming agent gets +0.1 for acting on a request)
             if self.queue:
-                req = self.queue.popleft() # Route the front request
-                if action.target == "LLM" and req["type"] == "complex":
-                    reward += 0.1
-                elif action.target == "SLM" and req["type"] == "simple":
-                    reward += 0.1
+                if len(self.active_vms) == 0:
+                    reward -= 0.5  # Penalty for routing to dead air
                 else:
-                    reward -= 0.5 # Penalty for hallucination/failure
+                    req = self.queue.popleft()# Route the front request
+                    if action.target == "LLM" and req["type"] == "complex":
+                        reward += 0.1
+                    elif action.target == "SLM" and req["type"] == "simple":
+                        reward += 0.1
+                    else:
+                        reward -= 0.5 # Penalty for hallucination/failure
                     
         elif action.action_type == ActionType.HOLD:
             if self.queue:
@@ -134,7 +139,7 @@ class MyEnvironment(Environment):
                 self.queue.append(req)
                     
         elif action.action_type == ActionType.PROVISION:
-            # Task 3 Logic: Start the 120-step timer for a new VM
+            # Task 3 Logic: Start the 24-step timer for a new VM
             self.provisioning_vms.append({
                 "id": str(uuid4())[:8],
                 "lora_id": action.lora_id,
